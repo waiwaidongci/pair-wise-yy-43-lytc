@@ -71,7 +71,8 @@ def make_handler(service: Service, static_dir: str):
                 status = 400
             else:
                 status = 500
-            self._json(status, {"error": exc.__class__.__name__, "message": str(exc)})
+            self._json(status, {"error": exc.__class__.__name__, "message": str(exc),
+                                **({"gaps": exc.gaps} if getattr(exc, "gaps", None) else {})})
 
         def do_GET(self) -> None:
             try:
@@ -89,6 +90,37 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"records": service.list_records(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/ships"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"ships": service.list_ships(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/shore-tanks"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"shore_tanks": service.list_shore_tanks(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/progress"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    service.list_items(role)
+                    self._json(200, service.transfer_progress(item_id))
+                elif path.startswith("/api/items/") and path.endswith("/fleet"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.fleet(item_id, role))
+                elif path.startswith("/api/items/") and path.endswith("/transfers"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"transfers": service.list_transfers(item_id, role)})
+                elif "/transfers/" in path:
+                    parts = path.strip("/").split("/")
+                    item_id = int(parts[2]); transfer_id = int(parts[4])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.get_transfer(item_id, transfer_id, role))
                 elif path.startswith("/api/items/"):
                     item_id = int(path.rsplit("/", 1)[-1])
                     actor, role = self._identity()
@@ -113,6 +145,40 @@ def make_handler(service: Service, static_dir: str):
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/ships"):
+                    item_id = int(path.split("/")[3])
+                    self._json(201, service.create_ship(item_id, body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/shore-tanks"):
+                    item_id = int(path.split("/")[3])
+                    self._json(201, service.create_shore_tank(item_id, body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/transfers"):
+                    item_id = int(path.split("/")[3])
+                    self._json(201, service.create_transfer(item_id, body, actor, role))
+                elif "/tanks/" in path and path.endswith("/plan"):
+                    parts = path.strip("/").split("/")
+                    item_id = int(parts[2]); tank_id = int(parts[4])
+                    self._json(200, service.revise_tank_plan(
+                        item_id, tank_id, body, actor, role))
+                elif "/ships/" in path and path.endswith("/tanks"):
+                    parts = path.strip("/").split("/")
+                    item_id = int(parts[2]); ship_id = int(parts[4])
+                    self._json(201, service.create_tank(
+                        item_id, ship_id, body, actor, role))
+                elif "/transfers/" in path and path.endswith("/precheck"):
+                    parts = path.strip("/").split("/")
+                    item_id = int(parts[2]); transfer_id = int(parts[4])
+                    self._json(200, service.precheck_transfer(
+                        item_id, transfer_id, body, actor, role))
+                elif "/transfers/" in path and path.endswith("/measure"):
+                    parts = path.strip("/").split("/")
+                    item_id = int(parts[2]); transfer_id = int(parts[4])
+                    self._json(200, service.measure_transfer(
+                        item_id, transfer_id, body, actor, role))
+                elif "/transfers/" in path and path.endswith("/confirm"):
+                    parts = path.strip("/").split("/")
+                    item_id = int(parts[2]); transfer_id = int(parts[4])
+                    self._json(200, service.confirm_transfer(
+                        item_id, transfer_id, body, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/transition"):
                     item_id = int(path.split("/")[3])
                     target = body.get("target")

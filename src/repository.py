@@ -65,6 +65,67 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS ships (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(item_id, name)
+                );
+                CREATE TABLE IF NOT EXISTS wreck_tanks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ship_id INTEGER NOT NULL REFERENCES ships(id) ON DELETE CASCADE,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    capacity REAL NOT NULL,
+                    plan_version INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(ship_id, name)
+                );
+                CREATE TABLE IF NOT EXISTS shore_tanks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    capacity REAL NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(item_id, name)
+                );
+                CREATE TABLE IF NOT EXISTS transfers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    tank_id INTEGER NOT NULL REFERENCES wreck_tanks(id),
+                    shore_tank_id INTEGER NOT NULL REFERENCES shore_tanks(id),
+                    ref TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'planned'
+                        CHECK(status IN ('planned','held','in_progress','reconciling','confirmed')),
+                    planned_qty REAL NOT NULL,
+                    grounding_resistance REAL,
+                    wind_speed REAL,
+                    remaining_capacity REAL,
+                    failed_items TEXT NOT NULL DEFAULT '[]',
+                    checked_at TEXT,
+                    ship_qty REAL,
+                    shore_qty REAL,
+                    diff_ratio REAL,
+                    ship_ticket TEXT,
+                    shore_ticket TEXT,
+                    reconciliation_note TEXT,
+                    measured_by TEXT,
+                    measured_at TEXT,
+                    confirmed_by TEXT,
+                    confirmed_at TEXT,
+                    confirmation_voided INTEGER NOT NULL DEFAULT 0,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(item_id, ref)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_transfers_open_tank
+                    ON transfers(tank_id)
+                    WHERE status IN ('planned','held','in_progress','reconciling');
+                CREATE INDEX IF NOT EXISTS ix_transfers_item ON transfers(item_id);
             """)
 
     @staticmethod
@@ -209,6 +270,211 @@ class Repository:
                 return False
             previous = row["entry_hash"]
         return True
+
+    # ---------- 舱级转驳实体 ----------
+    def create_ship(self, item_id: int, name: str, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    "INSERT INTO ships(item_id,name,created_by,created_at) VALUES(?,?,?,?)",
+                    (item_id, name, actor, now))
+                ship_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("沉船名称已存在") from exc
+        return self.get_ship(ship_id)
+
+    def get_ship(self, ship_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM ships WHERE id=?", (ship_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("沉船不存在")
+        return dict(row)
+
+    def list_ships(self, item_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM ships WHERE item_id=? ORDER BY id", (item_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_tank(self, ship_id: int, item_id: int, name: str,
+                    capacity: float, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO wreck_tanks(ship_id,item_id,name,capacity,plan_version,
+                       updated_at,created_at) VALUES(?,?,?,?,'1',?,?)""",
+                    (ship_id, item_id, name, capacity, now, now))
+                tank_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("船舱名称在该沉船已存在") from exc
+        return self.get_tank(tank_id)
+
+    def get_tank(self, tank_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM wreck_tanks WHERE id=?", (tank_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("船舱不存在")
+        return dict(row)
+
+    def list_tanks(self, ship_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM wreck_tanks WHERE ship_id=? ORDER BY id",
+                (ship_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def revise_tank_plan(self, tank_id: int, capacity: float, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """UPDATE wreck_tanks SET capacity=?, plan_version=plan_version+1, updated_at=?
+                       WHERE id=?""", (capacity, now, tank_id))
+                if cur.rowcount == 0:
+                    raise NotFoundError("船舱不存在")
+                # 同舱已确认作业原确认作废：部分唯一索引会在存在其他未结作业时冲突，整体回滚
+                self.conn.execute(
+                    """UPDATE transfers SET confirmation_voided=1, updated_at=?
+                       WHERE tank_id=? AND status='confirmed' AND confirmation_voided=0""",
+                    (now, tank_id))
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("该舱存在未结转驳作业，舱容计划修订已回滚") from exc
+        return self.get_tank(tank_id)
+
+    def create_shore_tank(self, item_id: int, name: str, capacity: float) -> Dict[str, Any]:
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    "INSERT INTO shore_tanks(item_id,name,capacity,created_at) VALUES(?,?,?,?)",
+                    (item_id, name, capacity, now))
+                tank_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("岸罐名称已存在") from exc
+        return self.get_shore_tank(tank_id)
+
+    def get_shore_tank(self, shore_tank_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM shore_tanks WHERE id=?", (shore_tank_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("岸罐不存在")
+        return dict(row)
+
+    def list_shore_tanks(self, item_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM shore_tanks WHERE item_id=? ORDER BY id",
+                (item_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def shore_tank_committed(self, shore_tank_id: int,
+                             exclude_transfer_id: Optional[int] = None) -> float:
+        """岸罐已承诺占用容量：未结作业按计划量，已确认作业按岸端实收量"""
+        sql = " WHERE shore_tank_id=?"
+        params: tuple = (shore_tank_id,)
+        if exclude_transfer_id is not None:
+            sql += " AND id!=?"
+            params = (shore_tank_id, exclude_transfer_id)
+        with self._lock:
+            row = self.conn.execute(
+                f"""SELECT COALESCE(SUM(CASE WHEN status='confirmed' AND confirmation_voided=0
+                        THEN COALESCE(shore_qty, planned_qty) ELSE planned_qty END),0) AS n
+                   FROM transfers{sql}
+                   AND (status!='confirmed' OR confirmation_voided=1)""",
+                params).fetchone()
+            confirmed = self.conn.execute(
+                f"""SELECT COALESCE(SUM(COALESCE(shore_qty, planned_qty)),0) AS n
+                   FROM transfers{sql}
+                   AND status='confirmed' AND confirmation_voided=0""",
+                params).fetchone()
+        return float(row["n"]) + float(confirmed["n"])
+
+    _TRANSFER_FIELDS = (
+        "status", "planned_qty", "grounding_resistance", "wind_speed", "remaining_capacity",
+        "failed_items", "checked_at", "ship_qty", "shore_qty", "diff_ratio", "ship_ticket",
+        "shore_ticket", "reconciliation_note", "measured_by", "measured_at",
+        "confirmed_by", "confirmed_at", "confirmation_voided")
+
+    def create_transfer(self, item_id: int, tank_id: int, shore_tank_id: int,
+                        ref: str, planned_qty: float, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO transfers(item_id,tank_id,shore_tank_id,ref,status,
+                       planned_qty,failed_items,confirmation_voided,created_by,
+                       created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (item_id, tank_id, shore_tank_id, ref, "planned",
+                     planned_qty, "[]", 0, actor, now, now))
+                transfer_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            msg = str(exc)
+            if "ux_transfers_open_tank" in msg:
+                raise ConflictError("该沉船舱已有一项未结作业，不能重复开工") from exc
+            raise ConflictError("转驳作业编号已存在") from exc
+        return self.get_transfer(transfer_id)
+
+    def get_transfer(self, transfer_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT t.*, s.name AS ship_name, tk.name AS tank_name,
+                          tk.plan_version AS plan_version, tk.capacity AS tank_capacity,
+                          st.name AS shore_tank_name, st.capacity AS shore_tank_capacity,
+                          st.id AS shore_side_id
+                   FROM transfers t
+                   JOIN wreck_tanks tk ON tk.id=t.tank_id
+                   JOIN ships s ON s.id=tk.ship_id
+                   JOIN shore_tanks st ON st.id=t.shore_tank_id
+                   WHERE t.id=?""", (transfer_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("转驳作业不存在")
+        return self._transfer(row)
+
+    def list_transfers(self, item_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT t.*, s.name AS ship_name, tk.name AS tank_name,
+                          tk.plan_version AS plan_version, tk.capacity AS tank_capacity,
+                          st.name AS shore_tank_name, st.capacity AS shore_tank_capacity,
+                          st.id AS shore_side_id
+                   FROM transfers t
+                   JOIN wreck_tanks tk ON tk.id=t.tank_id
+                   JOIN ships s ON s.id=tk.ship_id
+                   JOIN shore_tanks st ON st.id=t.shore_tank_id
+                   WHERE t.item_id=? ORDER BY t.id""", (item_id,)).fetchall()
+        return [self._transfer(row) for row in rows]
+
+    def update_transfer(self, transfer_id: int, fields: Dict[str, Any],
+                        void_tank_id: Optional[int] = None) -> Dict[str, Any]:
+        now = utc_now()
+        updates = {key: value for key, value in fields.items()
+                   if key in self._TRANSFER_FIELDS}
+        updates["updated_at"] = now
+        columns = ",".join(f"{key}=?" for key in updates)
+        params = tuple(updates.values()) + (transfer_id,)
+        with self._lock, self.conn:
+            try:
+                cur = self.conn.execute(
+                    f"UPDATE transfers SET {columns} WHERE id=?", params)
+            except sqlite3.IntegrityError as exc:
+                if "ux_transfers_open_tank" in str(exc):
+                    raise ConflictError("该沉船舱已有一项未结作业，不能重复开工") from exc
+                raise
+            if cur.rowcount == 0:
+                raise NotFoundError("转驳作业不存在")
+        return self.get_transfer(transfer_id)
+
+    @staticmethod
+    def _transfer(row: sqlite3.Row) -> Dict[str, Any]:
+        result = dict(row)
+        result["failed_items"] = json.loads(result["failed_items"] or "[]")
+        result["confirmation_voided"] = bool(result["confirmation_voided"])
+        return result
 
     def close(self) -> None:
         with self._lock:
