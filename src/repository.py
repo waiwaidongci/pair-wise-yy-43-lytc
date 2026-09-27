@@ -65,6 +65,37 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS tanks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    capacity REAL NOT NULL,
+                    plan_version INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(item_id, name)
+                );
+                CREATE TABLE IF NOT EXISTS transfers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    tank_id INTEGER NOT NULL REFERENCES tanks(id) ON DELETE CASCADE,
+                    ship_name TEXT NOT NULL,
+                    planned_quantity REAL NOT NULL,
+                    ship_quantity REAL,
+                    shore_quantity REAL,
+                    status TEXT NOT NULL
+                        CHECK(status IN ('pending','open','review','confirmed','void')),
+                    failed_checks TEXT NOT NULL DEFAULT '[]',
+                    measurement_ticket TEXT,
+                    plan_version INTEGER NOT NULL DEFAULT 1,
+                    quantities_by TEXT,
+                    confirmed_by TEXT,
+                    external_ref TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(item_id, external_ref)
+                );
             """)
 
     @staticmethod
@@ -156,6 +187,183 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    @staticmethod
+    def _transfer(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        item["failed_checks"] = json.loads(item["failed_checks"] or "[]")
+        return item
+
+    def create_tank(self, item_id: int, name: str, capacity: float,
+                    actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        self.get_item(item_id)
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO tanks(item_id, name, capacity, plan_version,
+                       created_by, created_at) VALUES(?,?,?,1,?,?)""",
+                    (item_id, name, capacity, actor, now),
+                )
+                tank_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("舱名已存在") from exc
+        return self.get_tank(item_id, tank_id)
+
+    def get_tank(self, item_id: int, tank_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM tanks WHERE id=? AND item_id=?", (tank_id, item_id)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("舱不存在")
+        return dict(row)
+
+    def list_tanks(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM tanks WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def revise_tank_plan(self, item_id: int, tank_id: int, capacity: float,
+                         actor: str) -> tuple:
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE tanks SET capacity=?, plan_version=plan_version+1
+                   WHERE id=? AND item_id=?""",
+                (capacity, tank_id, item_id),
+            )
+            if cur.rowcount == 0:
+                raise NotFoundError("舱不存在")
+            rows = self.conn.execute(
+                "SELECT id FROM transfers WHERE tank_id=? AND status='confirmed'",
+                (tank_id,),
+            ).fetchall()
+            voided = [int(row["id"]) for row in rows]
+            if voided:
+                marks = ",".join("?" * len(voided))
+                self.conn.execute(
+                    f"UPDATE transfers SET status='void', updated_at=? WHERE id IN ({marks})",
+                    [utc_now()] + voided,
+                )
+        return self.get_tank(item_id, tank_id), voided
+
+    def tank_extracted(self, tank_id: int) -> float:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT COALESCE(SUM(ship_quantity),0) AS total FROM transfers
+                   WHERE tank_id=? AND ship_quantity IS NOT NULL""",
+                (tank_id,),
+            ).fetchone()
+        return float(row["total"])
+
+    def tank_busy_transfer(self, tank_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT * FROM transfers WHERE tank_id=?
+                   AND status IN ('pending','open','review') ORDER BY id DESC LIMIT 1""",
+                (tank_id,),
+            ).fetchone()
+        return self._transfer(row) if row is not None else None
+
+    def create_transfer(self, item_id: int, tank_id: int, ship_name: str,
+                        planned_quantity: float, status: str, failed_checks: list,
+                        plan_version: int, external_ref: Optional[str],
+                        actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                busy = self.conn.execute(
+                    """SELECT * FROM transfers WHERE tank_id=?
+                       AND status IN ('pending','open','review') ORDER BY id DESC LIMIT 1""",
+                    (tank_id,),
+                ).fetchone()
+                if busy is not None:
+                    gap = {"transfer_id": busy["id"], "tank_id": tank_id,
+                           "ship_name": busy["ship_name"], "status": busy["status"],
+                           "missing": "沉船舱已有未结作业"}
+                    raise ConflictError("沉船舱已有未结作业", details={"gaps": [gap]})
+                cur = self.conn.execute(
+                    """INSERT INTO transfers(item_id, tank_id, ship_name, planned_quantity,
+                       status, failed_checks, plan_version, external_ref, created_by,
+                       created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (item_id, tank_id, ship_name, planned_quantity, status,
+                     json.dumps(failed_checks, ensure_ascii=False), plan_version,
+                     external_ref, actor, now, now),
+                )
+                transfer_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("转驳作业唯一标识已存在") from exc
+        return self.get_transfer(item_id, transfer_id)
+
+    def get_transfer(self, item_id: int, transfer_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM transfers WHERE id=? AND item_id=?",
+                (transfer_id, item_id),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("转驳作业不存在")
+        return self._transfer(row)
+
+    def list_transfers(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM transfers WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+        return [self._transfer(row) for row in rows]
+
+    def set_transfer_recheck(self, transfer_id: int, planned_quantity: float,
+                             status: str, failed_checks: list) -> None:
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE transfers SET planned_quantity=?, status=?, failed_checks=?,
+                   updated_at=? WHERE id=? AND status='pending'""",
+                (planned_quantity, status,
+                 json.dumps(failed_checks, ensure_ascii=False), utc_now(), transfer_id),
+            )
+            if cur.rowcount == 0:
+                raise ConflictError("仅待处理作业可重新核对")
+
+    def set_transfer_quantities(self, transfer_id: int, ship_quantity: float,
+                                shore_quantity: float, status: str, actor: str,
+                                plan_version: int,
+                                confirmed_by: Optional[str]) -> None:
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE transfers SET ship_quantity=?, shore_quantity=?, status=?,
+                   quantities_by=?, confirmed_by=?, plan_version=?, updated_at=?
+                   WHERE id=? AND status='open'""",
+                (ship_quantity, shore_quantity, status, actor, confirmed_by,
+                 plan_version, utc_now(), transfer_id),
+            )
+            if cur.rowcount == 0:
+                raise ConflictError("仅进行中的作业可录入计量")
+
+    def set_transfer_confirmed(self, transfer_id: int, measurement_ticket: str,
+                               plan_version: int, actor: str) -> None:
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE transfers SET status='confirmed', measurement_ticket=?,
+                   confirmed_by=?, plan_version=?, updated_at=?
+                   WHERE id=? AND status IN ('review','void')""",
+                (measurement_ticket, actor, plan_version, utc_now(), transfer_id),
+            )
+            if cur.rowcount == 0:
+                raise ConflictError("仅待核对或已作废的作业可确认")
+
+    def unresolved_differences(self, item_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT t.*, k.name AS tank_name FROM transfers t
+                   JOIN tanks k ON k.id=t.tank_id
+                   WHERE t.item_id=? AND t.status IN ('review','void') ORDER BY t.id""",
+                (item_id,),
+            ).fetchall()
+        return [self._transfer(row) for row in rows]
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

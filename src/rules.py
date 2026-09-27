@@ -3,6 +3,9 @@ from .domain import ConflictError, ValidationError
 TITLE='溢油应急响应与任务追踪'; ENTITY='溢油事件'; ID_PREFIX='OS'
 SEVERITIES=['minor', 'moderate', 'major', 'catastrophic']; STATES=['reported', 'assessing', 'containing', 'recovering', 'monitoring', 'closed']; TRANSITIONS={'reported': ['assessing'], 'assessing': ['containing'], 'containing': ['recovering'], 'recovering': ['monitoring'], 'monitoring': ['closed'], 'closed': []}; TRANSITION_ROLES={'assessing': ['response_commander'], 'containing': ['response_commander'], 'recovering': ['operations'], 'monitoring': ['operations'], 'closed': ['response_commander']}
 CREATE_ROLES=set(['observer', 'response_commander']); RECORD_ROLES=set(['response_commander', 'operations']); AUDIT_ROLES=set(['response_commander', 'viewer']); VIEW_ROLES=set(['observer', 'response_commander', 'operations', 'viewer'])
+TRANSFER_STATUSES=['pending', 'open', 'review', 'confirmed', 'void']; TANK_BUSY_STATUSES=('pending', 'open', 'review'); UNRESOLVED_DIFFERENCE_STATUSES=('review', 'void')
+MAX_GROUND_RESISTANCE=10.0; MAX_WIND_SPEED=15.0; DISCREPANCY_TOLERANCE_PCT=2.0
+TANK_ROLES=set(['response_commander', 'operations']); TRANSFER_ROLES=set(['response_commander', 'operations']); CONFIRM_ROLES=set(['response_commander', 'operations']); PLAN_ROLES=set(['response_commander'])
 SEVERITY_WEIGHT={'minor': 1.0, 'moderate': 3.0, 'major': 6.0, 'catastrophic': 9.0}; DEADLINE_HOURS={'minor': 72, 'moderate': 24, 'major': 8, 'catastrophic': 4}; TERMINAL_STATES=set(['closed'])
 def priority_score(severity,quantity=0.0,threshold=1.0,open_records=0):
     if severity not in SEVERITY_WEIGHT: raise ValidationError("unknown severity")
@@ -20,3 +23,15 @@ def validate_transition(current,target):
     if not can_transition(current,target): raise ConflictError(f"不能从{current}转换到{target}")
 def completion_blockers(target,open_records): return ["仍有未关闭事项"] if target in TERMINAL_STATES and open_records>0 else []
 def role_for_transition(target): return set(TRANSITION_ROLES.get(target,[]))
+def prestart_failures(quantity,remaining_capacity,ground_resistance,wind_speed):
+    failures=[]
+    if quantity>remaining_capacity: failures.append('剩余舱容')
+    if ground_resistance>MAX_GROUND_RESISTANCE: failures.append('接地电阻')
+    if wind_speed>MAX_WIND_SPEED: failures.append('风速')
+    return failures
+def discrepancy_pct(ship_quantity,shore_quantity):
+    ship=float(ship_quantity); shore=float(shore_quantity)
+    if ship==0: return 0.0 if shore==0 else 100.0
+    return abs(ship-shore)/ship*100.0
+def transfer_needs_review(ship_quantity,shore_quantity):
+    return discrepancy_pct(ship_quantity,shore_quantity)>DISCREPANCY_TOLERANCE_PCT
